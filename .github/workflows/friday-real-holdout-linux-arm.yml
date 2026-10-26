@@ -1,0 +1,89 @@
+name: FRIDAY real-world holdout Linux ARM
+
+on:
+  push:
+    paths:
+      - '.github/workflows/friday-real-holdout-linux-arm.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  real-world-holdout-linux-arm:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 55
+    env:
+      MODEL_ALIAS: qwen3-8b-local
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - name: Checkout public benchmark source
+        uses: actions/checkout@v4
+        with:
+          repository: ImaginatyM/social-app
+          ref: benchmark/friday-real-holdout-2026-10-26
+          path: benchmark-src
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Show ARM runner
+        run: |
+          uname -a
+          uname -m
+          nproc
+          free -h
+      - name: Download latest llama.cpp Ubuntu arm64 CPU binary
+        run: |
+          set -euo pipefail
+          RELEASE_JSON="$(curl -fsSL -H 'Accept: application/vnd.github+json' -H 'User-Agent: friday-benchmark' https://api.github.com/repos/ggml-org/llama.cpp/releases/latest)"
+          URL="$(printf '%s' "$RELEASE_JSON" | jq -r '.assets[] | select(.name | test("ubuntu-arm64"; "i")) | .browser_download_url' | head -n1)"
+          test -n "$URL" && test "$URL" != "null"
+          echo "llama.cpp asset: $URL"
+          curl -fL --retry 3 -o /tmp/llama-arm64.tar.gz "$URL"
+          mkdir -p /tmp/llama
+          tar -xzf /tmp/llama-arm64.tar.gz -C /tmp/llama --strip-components=1 || tar -xzf /tmp/llama-arm64.tar.gz -C /tmp/llama
+          find /tmp/llama -maxdepth 3 -type f -name 'llama-server' -print
+          SERVER="$(find /tmp/llama -type f -name 'llama-server' | head -n1)"
+          chmod +x "$SERVER"
+          echo "LLAMA_SERVER=$SERVER" >> "$GITHUB_ENV"
+      - name: Download official Qwen3-8B Q4_K_M GGUF
+        run: |
+          curl -fL --retry 5 --retry-delay 3 \
+            -o /tmp/Qwen3-8B-Q4_K_M.gguf \
+            'https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf?download=true'
+          ls -lh /tmp/Qwen3-8B-Q4_K_M.gguf
+      - name: Start local Qwen3-8B llama.cpp server
+        run: |
+          nohup "$LLAMA_SERVER" \
+            -m /tmp/Qwen3-8B-Q4_K_M.gguf \
+            --alias "$MODEL_ALIAS" \
+            --host 127.0.0.1 \
+            --port 8080 \
+            -c 8192 \
+            -t "$(nproc)" \
+            > /tmp/friday-llama.log 2>&1 &
+          echo $! > /tmp/friday-llama.pid
+          for i in $(seq 1 180); do
+            if curl -fsS http://127.0.0.1:8080/v1/models >/tmp/models.json 2>/dev/null; then
+              cat /tmp/models.json
+              exit 0
+            fi
+            if ! kill -0 "$(cat /tmp/friday-llama.pid)" 2>/dev/null; then
+              cat /tmp/friday-llama.log
+              exit 1
+            fi
+            sleep 2
+          done
+          cat /tmp/friday-llama.log
+          exit 1
+      - name: Run RAW vs PROOF_FOCUS real-world holdout
+        working-directory: benchmark-src
+        run: |
+          python benchmarks/friday_real_world_holdout_v3.py \
+            --base-url http://127.0.0.1:8080 \
+            --model "$MODEL_ALIAS" \
+            --max-rounds 10
+      - name: Print llama.cpp server tail
+        if: always()
+        run: tail -n 100 /tmp/friday-llama.log || true
